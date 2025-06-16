@@ -59,6 +59,8 @@ class SmartJoggingRouteGenerator:
             # Load network with a buffer around target distance
             buffer_distance = max(distance * 2, 1000)  # At least 1km buffer
             
+            print(f"   Loading {network_type} network within {buffer_distance}m radius...")
+            
             self.graph = ox.graph_from_point(
                 center_coords, 
                 dist=buffer_distance, 
@@ -66,9 +68,17 @@ class SmartJoggingRouteGenerator:
                 simplify=True
             )
             
-            # Add edge lengths and travel times
-            self.graph = ox.add_edge_speeds(self.graph)
-            self.graph = ox.add_edge_travel_times(self.graph)
+            # Ensure the graph has edge lengths
+            if not any('length' in data for _, _, data in self.graph.edges(data=True)):
+                print("   Adding edge lengths to graph...")
+                self.graph = ox.add_edge_lengths(self.graph)
+            
+            # Add edge speeds and travel times for better routing
+            try:
+                self.graph = ox.add_edge_speeds(self.graph)
+                self.graph = ox.add_edge_travel_times(self.graph)
+            except:
+                print("   Note: Could not add speeds/travel times, using lengths only")
             
             self.start_coords = center_coords
             self.start_node = ox.nearest_nodes(self.graph, center_coords[1], center_coords[0])
@@ -84,19 +94,39 @@ class SmartJoggingRouteGenerator:
         total_distance = 0
         for i in range(len(route_nodes) - 1):
             try:
+                # Get edge data between consecutive nodes
                 edge_data = self.graph[route_nodes[i]][route_nodes[i + 1]]
-                # Handle multiple edges between nodes
+                
+                # Handle multiple edges between nodes (MultiDiGraph)
                 if isinstance(edge_data, dict):
-                    edge_length = min([data.get('length', 0) for data in edge_data.values()])
+                    # Find the edge with length data
+                    edge_length = 0
+                    for key, data in edge_data.items():
+                        if 'length' in data and data['length'] > 0:
+                            edge_length = data['length']
+                            break
+                    
+                    # If no length found, calculate from coordinates
+                    if edge_length == 0:
+                        node1 = self.graph.nodes[route_nodes[i]]
+                        node2 = self.graph.nodes[route_nodes[i + 1]]
+                        edge_length = geodesic((node1['y'], node1['x']), (node2['y'], node2['x'])).meters
                 else:
                     edge_length = edge_data.get('length', 0)
+                    if edge_length == 0:
+                        node1 = self.graph.nodes[route_nodes[i]]
+                        node2 = self.graph.nodes[route_nodes[i + 1]]
+                        edge_length = geodesic((node1['y'], node1['x']), (node2['y'], node2['x'])).meters
+                
                 total_distance += edge_length
-            except KeyError:
+                
+            except (KeyError, TypeError):
                 # Calculate straight-line distance if edge not found
                 node1 = self.graph.nodes[route_nodes[i]]
                 node2 = self.graph.nodes[route_nodes[i + 1]]
                 dist = geodesic((node1['y'], node1['x']), (node2['y'], node2['x'])).meters
                 total_distance += dist
+                
         return total_distance
     
     def find_nodes_at_distance(self, target_distance: float, tolerance: float = 0.2) -> List:
@@ -140,15 +170,24 @@ class SmartJoggingRouteGenerator:
             return {"error": "Network not loaded"}
         
         try:
+            print(f"   Finding candidate waypoints...")
             # Find potential end nodes at roughly half the target distance
             half_distance = target_distance / 2
             candidates = self.find_nodes_at_distance(half_distance)
+            
+            if not candidates:
+                print(f"   No suitable waypoints found at {half_distance}m distance")
+                return {"error": "No suitable waypoints found for route generation"}
+            
+            print(f"   Found {len(candidates)} candidate waypoints")
+            print(f"   Testing route combinations...")
             
             best_route = None
             best_distance_diff = float('inf')
             best_total_distance = 0
             
-            for candidate_node, _ in candidates[:10]:  # Try top 10 candidates
+            # Try different combinations of waypoints
+            for i, (candidate_node, _) in enumerate(candidates[:10]):  # Try top 10 candidates
                 try:
                     # Find shortest path to candidate
                     path_to = nx.shortest_path(
@@ -165,26 +204,36 @@ class SmartJoggingRouteGenerator:
                     
                     # Calculate total distance
                     route_distance = self.calculate_route_distance(full_route)
-                    distance_diff = abs(route_distance - target_distance)
                     
-                    if distance_diff < best_distance_diff:
-                        best_distance_diff = distance_diff
-                        best_route = full_route
-                        best_total_distance = route_distance
+                    if route_distance > 0:  # Only consider valid routes
+                        distance_diff = abs(route_distance - target_distance)
                         
-                except (nx.NetworkXNoPath, KeyError):
+                        print(f"     Route {i+1}: {route_distance/1000:.2f}km "
+                              f"(target: {target_distance/1000:.2f}km)")
+                        
+                        if distance_diff < best_distance_diff:
+                            best_distance_diff = distance_diff
+                            best_route = full_route
+                            best_total_distance = route_distance
+                            
+                except (nx.NetworkXNoPath, KeyError) as e:
+                    print(f"     Route {i+1}: No path found")
                     continue
             
-            if best_route:
+            if best_route and best_total_distance > 0:
+                accuracy = 1 - (best_distance_diff / target_distance)
+                print(f"   Best route: {best_total_distance/1000:.2f}km "
+                      f"({accuracy*100:.1f}% accuracy)")
+                
                 return {
                     "route_nodes": best_route,
                     "distance_meters": best_total_distance,
                     "distance_km": best_total_distance / 1000,
                     "target_distance": target_distance,
-                    "accuracy": 1 - (best_distance_diff / target_distance)
+                    "accuracy": accuracy
                 }
             else:
-                return {"error": "Could not generate suitable route"}
+                return {"error": "Could not generate suitable route - all candidates resulted in zero distance"}
                 
         except Exception as e:
             return {"error": f"Route generation failed: {e}"}
